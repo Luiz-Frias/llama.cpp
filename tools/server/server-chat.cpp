@@ -3,6 +3,57 @@
 
 #include <sstream>
 
+static const std::string responses_tool_marker = "__llama_ns_";
+
+std::string server_chat_encode_responses_tool_name(const std::string & tool_namespace, const std::string & name) {
+    if (tool_namespace.empty() && name.find(responses_tool_marker) == std::string::npos) {
+        return name;
+    }
+    // Keep the function name recognizable to the model. Hex avoids marker collisions in the namespace.
+    static const char hex[] = "0123456789abcdef";
+    std::string encoded = name + responses_tool_marker;
+    for (unsigned char c : tool_namespace) {
+        encoded += hex[c >> 4];
+        encoded += hex[c & 15];
+    }
+    return encoded;
+}
+
+json server_chat_format_responses_tool_call(const common_chat_tool_call & tool_call, const std::string & status) {
+    json item = {
+        {"id",        "fc_" + tool_call.id},
+        {"type",      "function_call"},
+        {"status",    status},
+        {"arguments", tool_call.arguments},
+        {"call_id",   "call_" + tool_call.id},
+        {"name",      tool_call.name},
+    };
+    const std::string & name = tool_call.name;
+    const size_t pos = name.rfind(responses_tool_marker);
+    if (pos == std::string::npos || pos == 0) {
+        return item;
+    }
+    const size_t start = pos + responses_tool_marker.size();
+    if ((name.size() - start) % 2 != 0) {
+        return item;
+    }
+    std::string tool_namespace;
+    static const std::string hex = "0123456789abcdef";
+    for (size_t i = start; i < name.size(); i += 2) {
+        const size_t high = hex.find(name[i]);
+        const size_t low  = hex.find(name[i + 1]);
+        if (high == std::string::npos || low == std::string::npos) {
+            return item;
+        }
+        tool_namespace += char((high << 4) | low);
+    }
+    if (!tool_namespace.empty()) {
+        item["namespace"] = tool_namespace;
+    }
+    item["name"] = name.substr(0, pos);
+    return item;
+}
+
 json server_chat_convert_responses_tools(const json & tools) {
     if (!tools.is_array()) {
         throw std::invalid_argument("'tools' must be an array of objects");
@@ -12,12 +63,33 @@ json server_chat_convert_responses_tools(const json & tools) {
         json chatcmpl_tool;
 
         const std::string type = json_value(resp_tool, "type", std::string());
+        if (type == "namespace") {
+            if (!resp_tool.contains("name") || !resp_tool.at("name").is_string() || resp_tool.at("name").get<std::string>().empty() ||
+                !resp_tool.contains("tools") || !resp_tool.at("tools").is_array()) {
+                throw std::invalid_argument("Responses namespace requires a nonempty name and a tools array");
+            }
+            const std::string tool_namespace = resp_tool.at("name");
+            for (json inner_tool : resp_tool.at("tools")) {
+                if (json_value(inner_tool, "type", std::string()) != "function" ||
+                    !inner_tool.contains("name") || !inner_tool.at("name").is_string() || inner_tool.at("name").get<std::string>().empty()) {
+                    throw std::invalid_argument("Responses namespace members must be named function tools");
+                }
+                inner_tool.erase("type");
+                inner_tool["name"] = server_chat_encode_responses_tool_name(tool_namespace, inner_tool.at("name"));
+                if (!inner_tool.contains("strict")) {
+                    inner_tool["strict"] = true;
+                }
+                chatcmpl_tools.push_back({{"type", "function"}, {"function", inner_tool}});
+            }
+            continue;
+        }
         if (type != "function") {
             // Non-function Responses tools have no Chat Completions equivalent.
             SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
             continue;
         }
         resp_tool.erase("type");
+        resp_tool["name"] = server_chat_encode_responses_tool_name("", resp_tool.at("name"));
         chatcmpl_tool["type"] = "function";
 
         if (!resp_tool.contains("strict")) {
@@ -196,7 +268,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 json tool_call = {
                     {"function", json {
                         {"arguments", item.at("arguments")},
-                        {"name",      item.at("name")},
+                        {"name",      server_chat_encode_responses_tool_name(json_value(item, "namespace", std::string()), item.at("name"))},
                     }},
                     {"id",   item.at("call_id")},
                     {"type", "function"},
@@ -300,6 +372,24 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (response_body.contains("max_output_tokens")) {
         chatcmpl_body.erase("max_output_tokens");
         chatcmpl_body["max_tokens"] = response_body["max_output_tokens"];
+    }
+
+    if (response_body.contains("tool_choice") && response_body.at("tool_choice").is_object()) {
+        const json & choice = response_body.at("tool_choice");
+        if (json_value(choice, "type", std::string()) == "function" && choice.contains("name")) {
+            const std::string name = server_chat_encode_responses_tool_name(json_value(choice, "namespace", std::string()), choice.at("name"));
+            json selected_tools = json::array();
+            for (const auto & tool : chatcmpl_body.value("tools", json::array())) {
+                if (tool.at("function").at("name") == name) {
+                    selected_tools.push_back(tool);
+                }
+            }
+            if (selected_tools.empty()) {
+                throw std::invalid_argument("Responses tool_choice must name a declared function");
+            }
+            chatcmpl_body["tools"] = selected_tools;
+            chatcmpl_body["tool_choice"] = "required";
+        }
     }
 
     if (response_body.contains("reasoning")) {
