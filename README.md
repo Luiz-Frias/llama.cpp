@@ -17,6 +17,26 @@
 
 </div>
 
+## Mythwave packaging toolchain
+
+For Mythwave packaging validation, CMake 4.4.5 is the minimum accepted version.
+Check the executable selected by your shell before building; an installed
+Homebrew CMake does not override a mise shim automatically.
+
+```sh
+command -v cmake
+cmake --version
+mise which cmake
+"$(brew --prefix cmake)/bin/cmake" --version
+```
+
+Dotfiles currently pins the separate mise-managed CMake to 4.3.1. Use the
+Homebrew CMake 4.4.5 or newer for packaging validation, or deliberately update
+the owned mise pin before claiming the same toolchain. The source-only checks
+under 4.3.1 remain separate evidence; upstream's technical CMake minimum is
+unchanged. The `mythwave-llama` formula declares CMake as a build dependency and
+Homebrew selects it inside the package build environment.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
