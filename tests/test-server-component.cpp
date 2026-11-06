@@ -1,6 +1,8 @@
 #include "testing.h"
 
 #include "../tools/server/server-common.h"
+#include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "../tools/server/server-decision.h"
 #include "../tools/server/server-schema.h"
 
@@ -665,6 +667,128 @@ static void test_glob_match(testing & t) {
     });
 }
 
+static void test_responses_namespaces(testing & t) {
+    const json function = {
+        {"type", "function"}, {"name", "search"}, {"description", "Search"},
+        {"parameters", {{"type", "object"}, {"properties", json::object()}}}, {"strict", false},
+    };
+    const json tools = json::array({
+        {{"type", "namespace"}, {"name", "mcp__firecrawl"}, {"tools", json::array({function})}},
+        {{"type", "namespace"}, {"name", "mcp__other"}, {"tools", json::array({function})}},
+        function,
+    });
+
+    t.test("definitions", [&](testing & t) {
+        const json converted = server_chat_convert_responses_tools(tools);
+        t.assert_equal("all functions preserved", (size_t) 3, converted.size());
+        if (converted.size() != 3) {
+            return;
+        }
+        t.assert_equal("namespace encoded", std::string("search__llama_ns_6d63705f5f66697265637261776c"), converted[0]["function"]["name"].get<std::string>());
+        t.assert_true("namespaces distinct", converted[0]["function"]["name"] != converted[1]["function"]["name"]);
+        t.assert_equal("flat name unchanged", std::string("search"), converted[2]["function"]["name"].get<std::string>());
+        t.assert_true("strict preserved", converted[0]["function"]["strict"] == false);
+        t.assert_true("schema preserved", converted[0]["function"]["parameters"] == function["parameters"]);
+        t.assert_true("empty tools", server_chat_convert_responses_tools(json::array()).empty());
+    });
+
+    t.test("history", [&](testing & t) {
+        const json converted = server_chat_convert_responses_to_chatcmpl({
+            {"input", json::array({
+                {{"type", "function_call"}, {"namespace", "mcp__firecrawl"}, {"name", "search"}, {"arguments", "{}"}, {"call_id", "call_1"}},
+                {{"type", "function_call_output"}, {"call_id", "call_1"}, {"output", "found"}},
+            })},
+            {"tools", tools},
+        });
+        t.assert_equal("history uses definition name", std::string("search__llama_ns_6d63705f5f66697265637261776c"), converted["messages"][0]["tool_calls"][0]["function"]["name"].get<std::string>());
+        t.assert_equal("result retains call id", std::string("call_1"), converted["messages"][1]["tool_call_id"].get<std::string>());
+    });
+
+    t.test("forced choice", [&](testing & t) {
+        const json converted = server_chat_convert_responses_to_chatcmpl({
+            {"input", "Search"}, {"tools", tools},
+            {"tool_choice", {{"type", "function"}, {"namespace", "mcp__firecrawl"}, {"name", "search"}}},
+        });
+        t.assert_true("choice required", converted["tool_choice"] == "required");
+        t.assert_equal("only selected tool exposed", (size_t) 1, converted["tools"].size());
+        t.assert_equal("selected member", std::string("search__llama_ns_6d63705f5f66697265637261776c"), converted["tools"][0]["function"]["name"].get<std::string>());
+    });
+
+    t.test("output", [&](testing & t) {
+        server_task_result_cmpl_final result{};
+        result.oaicompat_msg.role = "assistant";
+        result.oaicompat_msg.tool_calls.push_back({"search__llama_ns_6d63705f5f66697265637261776c", "{}", "1"});
+        const json item = result.to_json_oaicompat_resp()["output"][0];
+        t.assert_equal("namespace restored", std::string("mcp__firecrawl"), item.value("namespace", ""));
+        t.assert_equal("member restored", std::string("search"), item.value("name", ""));
+        t.assert_equal("call id retained", std::string("call_1"), item.value("call_id", ""));
+        const json events = result.to_json_oaicompat_resp_stream();
+        t.assert_true("stream final item matches", events[0]["data"]["item"] == item);
+        t.assert_true("stream completed item matches", events.back()["data"]["response"]["output"][0] == item);
+
+        server_task_result_cmpl_partial partial{};
+        partial.oai_resp_created = true;
+        common_chat_msg_diff diff{};
+        diff.tool_call_index = 0;
+        diff.tool_call_delta = {"search__llama_ns_6d63705f5f66697265637261776c", "", "1"};
+        partial.oaicompat_msg_diffs.push_back(diff);
+        const json chunks = partial.to_json_oaicompat_resp();
+        bool found = false;
+        for (const auto & chunk : chunks) {
+            if (chunk["event"] == "response.output_item.added") {
+                found = true;
+                t.assert_equal("stream start namespace", std::string("mcp__firecrawl"), chunk["data"]["item"].value("namespace", ""));
+                t.assert_equal("stream start member", std::string("search"), chunk["data"]["item"].value("name", ""));
+            }
+        }
+        t.assert_true("stream start emitted", found);
+    });
+
+    t.test("reserved flat name", [&](testing & t) {
+        json flat = function;
+        flat["name"] = "search__llama_ns_6d63705f5f66697265637261776c";
+        const json converted = server_chat_convert_responses_tools(json::array({flat}));
+        server_task_result_cmpl_final result{};
+        result.oaicompat_msg.role = "assistant";
+        result.oaicompat_msg.tool_calls.push_back({converted[0]["function"]["name"], "{}", "1"});
+        const json item = result.to_json_oaicompat_resp()["output"][0];
+        t.assert_true("flat does not acquire namespace", !item.contains("namespace"));
+        t.assert_true("original name restored", item["name"] == flat["name"]);
+    });
+
+    t.test("name roundtrip", [&](testing & t) {
+        for (const std::string & tool_namespace : {"", "a", "a_b", "a.b", "__llama_ns_"}) {
+            for (const std::string & name : {"search", "a_b", "a.b", "__llama_ns_0_search"}) {
+                const std::string encoded = server_chat_encode_responses_tool_name(tool_namespace, name);
+                const json item = server_chat_format_responses_tool_call({encoded, "{}", "1"}, "completed");
+                t.assert_equal("name roundtrip", name, item.value("name", ""));
+                t.assert_equal("namespace roundtrip", tool_namespace, item.value("namespace", ""));
+            }
+        }
+        for (const std::string & name : {"__llama_ns_", "__llama_ns_x_search", "__llama_ns_999999999999999999999999_search", "__llama_ns_2_x", "search__llama_ns_x", "search__llama_ns_abc", "search__llama_ns_zz"}) {
+            const json item = server_chat_format_responses_tool_call({name, "{}", "1"}, "completed");
+            t.assert_equal("malformed name unchanged", name, item.value("name", ""));
+            t.assert_true("malformed name has no namespace", !item.contains("namespace"));
+        }
+    });
+
+    t.test("invalid namespace", [&](testing & t) {
+        for (const json & invalid : json::array({
+            {{"type", "namespace"}, {"name", ""}, {"tools", json::array({function})}},
+            {{"type", "namespace"}, {"name", "mcp"}, {"tools", "invalid"}},
+            {{"type", "namespace"}, {"name", "mcp"}, {"tools", json::array({{{"type", "namespace"}}})}},
+        })) {
+            bool thrown = false;
+            try {
+                server_chat_convert_responses_tools(json::array({invalid}));
+            } catch (const std::invalid_argument &) {
+                thrown = true;
+            }
+            t.assert_true("invalid namespace rejected", thrown);
+        }
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -678,6 +802,7 @@ int main(int argc, char ** argv) {
     }
 
     t.test("server_tokens", test_server_tokens);
+    t.test("responses_namespaces", test_responses_namespaces);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);
     t.test("json_helpers",  test_json_helpers);

@@ -11,8 +11,11 @@
 // Convert OpenAI Responses API format to OpenAI Chat Completions API format
 json server_chat_convert_responses_to_chatcmpl(const json & body);
 
-// Convert OpenAI Responses API tools to OpenAI Chat Completions API tools, non-function tools are skipped
+// Convert OpenAI Responses API function and namespace tools to OpenAI Chat Completions API tools
 json server_chat_convert_responses_tools(const json & tools);
+
+std::string server_chat_encode_responses_tool_name(const std::string & tool_namespace, const std::string & name);
+json server_chat_format_responses_tool_call(const common_chat_tool_call & tool_call, const std::string & status);
 
 // Convert Anthropic Messages API format to OpenAI Chat Completions API format
 json server_chat_convert_anthropic_to_oai(const json & body);

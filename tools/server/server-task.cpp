@@ -558,14 +558,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        output.push_back(json {
-            {"id",        "fc_" + tool_call.id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name},
-        });
+        output.push_back(server_chat_format_responses_tool_call(tool_call, "completed"));
     }
 
     std::time_t t = std::time(0);
@@ -668,14 +661,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
         const size_t item_output_index = output_index++;
-        const json output_item = {
-            {"id",        "fc_" + tool_call.id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name}
-        };
+        const json output_item = server_chat_format_responses_tool_call(tool_call, "completed");
         server_sent_events.push_back(json {
             {"event", "response.output_item.done"},
             {"data", json {
@@ -1287,14 +1273,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"data", json {
                     {"type",  "response.output_item.added"},
                     {"output_index", (anthropic_has_reasoning ? 1 : 0) + (text_block_started ? 1 : 0) + diff.tool_call_index},
-                    {"item", json {
-                        {"id",        "fc_" + diff.tool_call_delta.id},
-                        {"arguments", ""},
-                        {"call_id",   "call_" + diff.tool_call_delta.id},
-                        {"name",      diff.tool_call_delta.name},
-                        {"type",      "function_call"},
-                        {"status",    "in_progress"},
-                    }},
+                    {"item", server_chat_format_responses_tool_call({diff.tool_call_delta.name, "", diff.tool_call_delta.id}, "in_progress")},
                 }},
             });
             oai_resp_fc_id = diff.tool_call_delta.id;

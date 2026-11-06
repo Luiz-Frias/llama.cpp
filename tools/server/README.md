@@ -1690,6 +1690,10 @@ curl http://localhost:9931/v1/responses \
 
 This endpoint works by converting Responses request into Chat Completions request.
 
+Function tools can be grouped in `type: "namespace"` tools. Function calls preserve the original `namespace` and `name` in both streaming and non-streaming responses. Include these fields when replaying function calls in later requests. Functions with the same name in different namespaces remain distinct.
+
+Other Responses tool types, such as hosted `web_search`, are not implemented by this conversion and are skipped with a server warning.
+
 
 ### POST `/v1/embeddings`: OpenAI-compatible embeddings API
 
